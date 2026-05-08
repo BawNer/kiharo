@@ -1,0 +1,33 @@
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck      # незавёрнутые ошибки
+    - govet         # стандартные проверки
+    - ineffassign   # бесполезные присваивания
+    - staticcheck   # широкий набор статических проверок
+    - unused        # мёртвый код
+    - gofmt         # форматирование
+    - goimports     # порядок импортов
+    - misspell      # опечатки в комментариях
+    - revive        # стайл-замечания (заменяет deprecated golint)
+    - gosec         # потенциальные security issues
+    - bodyclose     # закрытие http.Body — на будущее
+    - contextcheck  # передача контекста — критично для kiharo
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported  # требует комментариев на экспортированных идентификаторах
+        severity: warning
+        disabled: false
+
+issues:
+  exclude-rules:
+    # В тестах допускаем меньше строгости.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec

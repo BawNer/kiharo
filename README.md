@@ -2,6 +2,7 @@
 
 Adaptive hedged requests for Go. Reduces tail latency without external dependencies.
 
+[![CI](https://github.com/BawNer/kiharo/actions/workflows/ci.yml/badge.svg)](https://github.com/BawNer/kiharo/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/BawNer/kiharo.svg)](https://pkg.go.dev/github.com/BawNer/kiharo)
 [![Go Report Card](https://goreportcard.com/badge/github.com/BawNer/kiharo)](https://goreportcard.com/report/github.com/BawNer/kiharo)
 
