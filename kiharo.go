@@ -1,8 +1,3 @@
-// Package kiharo implements an adaptive hedged-requests pattern for reducing tail latency.
-//
-// kiharo accumulates per-key latency statistics from successful first attempts
-// and uses a configurable percentile of those latencies as the delay before
-// launching hedged attempts. No external metrics system is required.
 package kiharo
 
 import (
@@ -13,24 +8,14 @@ import (
 	"time"
 )
 
-// Errors returned by Hedger.
 var (
-	// ErrUnknownKey is returned when Do is called with a key that was never
-	// passed to Register.
 	ErrUnknownKey = errors.New("kiharo: unknown key (did you call Register?)")
-
-	// ErrNilFunc is returned when the function passed to Do is nil.
-	ErrNilFunc = errors.New("kiharo: function must not be nil")
-
-	// ErrNilHedger is returned when Do is called with a nil *Hedger.
-	ErrNilHedger = errors.New("kiharo: Hedger is nil")
+	ErrNilFunc    = errors.New("kiharo: function must not be nil")
+	ErrNilHedger  = errors.New("kiharo: Hedger is nil")
 )
 
-// Option configures a Hedger at construction time.
 type Option func(*Hedger)
 
-// WithMetrics sets the metrics recorder used for all keys on this Hedger.
-// If unset, metrics are silently dropped.
 func WithMetrics(r MetricsRecorder) Option {
 	return func(h *Hedger) {
 		if r != nil {
@@ -39,20 +24,11 @@ func WithMetrics(r MetricsRecorder) Option {
 	}
 }
 
-// Hedger holds per-key latency statistics and dispatches hedged calls.
-//
-// One Hedger per application is the expected pattern. Construct via New;
-// the zero value is not usable.
-//
-// Hedger is safe for concurrent use.
 type Hedger struct {
-	// keys: string -> *stats. Read on every Do, written only at Register
-	// time, so sync.Map's read-mostly path fits well.
 	keys    sync.Map
 	metrics MetricsRecorder
 }
 
-// New creates a new Hedger.
 func New(opts ...Option) *Hedger {
 	h := &Hedger{metrics: noopRecorder{}}
 	for _, opt := range opts {
@@ -61,12 +37,6 @@ func New(opts ...Option) *Hedger {
 	return h
 }
 
-// Register configures a key. It must be called before Do is called with the
-// same key.
-//
-// Register panics on invalid cfg or duplicate keys, following the http.Handle
-// precedent: registration is a startup-time concern, and silent overwrites
-// are almost always bugs.
 func (h *Hedger) Register(key string, cfg RegisterConfig) {
 	if err := cfg.validate(); err != nil {
 		panic(fmt.Sprintf("kiharo: invalid RegisterConfig for key %q: %v", key, err))
@@ -77,7 +47,6 @@ func (h *Hedger) Register(key string, cfg RegisterConfig) {
 	}
 }
 
-// stats returns the *stats for key, or nil if unknown.
 func (h *Hedger) statsFor(key string) *stats {
 	v, ok := h.keys.Load(key)
 	if !ok {
@@ -86,22 +55,6 @@ func (h *Hedger) statsFor(key string) *stats {
 	return v.(*stats)
 }
 
-// Do executes fn up to MaxCalls times in parallel, using the adaptive delay
-// schedule for the registered key. The first successful result wins; remaining
-// in-flight attempts are cancelled via context.
-//
-// Latency of the first attempt — and only the first attempt, only when it
-// succeeds — is recorded into the key's sliding window. This keeps the baseline
-// clean: hedged latencies do not feed back into the percentile.
-//
-// If every attempt fails, Do returns the error from the first attempt that
-// completed. If ctx is cancelled before any attempt completes, Do returns ctx.Err().
-//
-// Do is a top-level function rather than a method on *Hedger because Go does
-// not currently allow type parameters on methods.
-//
-// fn must be safe for concurrent execution; each invocation receives a child
-// context derived from ctx.
 func Do[T any](
 	ctx context.Context,
 	h *Hedger,
@@ -122,15 +75,13 @@ func Do[T any](
 		return zero, fmt.Errorf("%w: %q", ErrUnknownKey, key)
 	}
 
-	maxCalls := s.cfg.MaxCalls
+	cfg := s.cfg
 	metrics := h.metrics
 
-	// Fast path: no hedging configured for this key.
-	if maxCalls == 1 {
-		start := time.Now()
+	// Fast path: no hedging configured.
+	if cfg.MaxCalls == 1 {
+		v, err, dur := runAttempt(ctx, cfg, fn)
 		metrics.RecordRequest(false)
-		v, err := fn(ctx)
-		dur := time.Since(start)
 		metrics.RecordResponse(false, err, dur)
 		if err == nil {
 			s.observe(dur)
@@ -138,17 +89,16 @@ func Do[T any](
 		return v, err
 	}
 
-	// Cancellable scope shared by all attempts. cancel() fires once we pick
-	// a winner so still-running attempts can tear down promptly.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	type result struct {
-		value  T
-		err    error
-		hedged bool
+		value     T
+		err       error
+		hedged    bool
+		retryable bool
 	}
-	results := make(chan result, maxCalls)
+	results := make(chan result, cfg.MaxCalls)
 	var wg sync.WaitGroup
 
 	launch := func(attempt int) {
@@ -156,30 +106,28 @@ func Do[T any](
 		go func() {
 			defer wg.Done()
 			hedged := attempt > 1
-			start := time.Now()
+
 			metrics.RecordRequest(hedged)
-			v, err := fn(runCtx)
-			dur := time.Since(start)
+			v, err, dur := runAttempt(runCtx, cfg, fn)
 			metrics.RecordResponse(hedged, err, dur)
+
 			// Only the first attempt's successful latency feeds the window.
-			// Otherwise smaller delays would produce more hedged samples and
-			// push the percentile down further — a feedback loop.
 			if !hedged && err == nil {
 				s.observe(dur)
 			}
+
+			retryable := classifyRetryable(err, cfg, runCtx)
+
 			select {
-			case results <- result{value: v, err: err, hedged: hedged}:
+			case results <- result{value: v, err: err, hedged: hedged, retryable: retryable}:
 			case <-runCtx.Done():
 			}
 		}()
 	}
 
-	// Scheduler: launch attempt 1 immediately, then read s.delay() fresh
-	// before each subsequent attempt. Reading fresh lets a fast first
-	// attempt update the window before attempt 3 is scheduled.
 	go func() {
 		launch(1)
-		for attempt := 2; attempt <= maxCalls; attempt++ {
+		for attempt := 2; attempt <= cfg.MaxCalls; attempt++ {
 			d := s.delay()
 			timer := time.NewTimer(d)
 			select {
@@ -206,13 +154,72 @@ func Do[T any](
 				}
 				return r.value, nil
 			}
+			// Non-retryable error: this is the final answer, no point waiting
+			// for or launching more attempts.
+			if !r.retryable {
+				return zero, r.err
+			}
 			if firstErr == nil {
 				firstErr = r.err
 			}
 			failed++
-			if failed >= maxCalls {
+			if failed >= cfg.MaxCalls {
 				return zero, firstErr
 			}
 		}
 	}
+}
+
+// runAttempt executes a single fn invocation with the configured AttemptTimeout
+// applied (if any). Returns the result, error, and wall-clock duration of the call.
+func runAttempt[T any](
+	parent context.Context,
+	cfg RegisterConfig,
+	fn func(ctx context.Context) (T, error),
+) (T, error, time.Duration) {
+	attemptCtx := parent
+	var cancel context.CancelFunc
+	if cfg.AttemptTimeout > 0 {
+		attemptCtx, cancel = context.WithTimeout(parent, cfg.AttemptTimeout)
+		defer cancel()
+	}
+
+	start := time.Now()
+	v, err := fn(attemptCtx)
+	dur := time.Since(start)
+
+	// If the parent is fine but the attempt context's deadline fired, this is
+	// our AttemptTimeout. Replace the generic deadline error with our sentinel
+	// so callers can distinguish attempt timeout from parent cancellation.
+	if err != nil && cfg.AttemptTimeout > 0 && parent.Err() == nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = ErrAttemptTimeout
+		}
+	}
+	return v, err, dur
+}
+
+// classifyRetryable decides whether an error should trigger more hedging or
+// be returned to the caller immediately.
+//
+//   - nil: not applicable (caller checks err == nil first)
+//   - parent context cancelled: parent will short-circuit anyway, value doesn't matter
+//   - ErrAttemptTimeout: always retryable (infrastructure-level failure)
+//   - IsRetryable nil: treat all errors as retryable (back-compat default)
+//   - otherwise: ask the user's filter
+func classifyRetryable(err error, cfg RegisterConfig, runCtx context.Context) bool {
+	if err == nil {
+		return true
+	}
+	if runCtx.Err() != nil {
+		// Context already torn down; the main loop is about to exit anyway.
+		return true
+	}
+	if errors.Is(err, ErrAttemptTimeout) {
+		return true
+	}
+	if cfg.IsRetryable == nil {
+		return true
+	}
+	return cfg.IsRetryable(err)
 }

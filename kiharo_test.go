@@ -461,3 +461,74 @@ func TestDo_UnknownKeyWrapped(t *testing.T) {
 		t.Errorf("got %q, want %q", err.Error(), want)
 	}
 }
+
+// Тестируем что 4xx возвращается сразу, без hedge.
+func TestDo_NonRetryableShortCircuits(t *testing.T) {
+	h := New()
+	cfg := fastConfig(2)
+	cfg.IsRetryable = func(err error) bool {
+		return !errors.Is(err, errBusinessError)
+	}
+	h.Register("k", cfg)
+
+	var n atomic.Int32
+	_, err := Do(context.Background(), h, "k", func(ctx context.Context) (int, error) {
+		n.Add(1)
+		return 0, errBusinessError
+	})
+	if !errors.Is(err, errBusinessError) {
+		t.Errorf("got %v, want errBusinessError", err)
+	}
+	// Должна быть только одна попытка — non-retryable не должен породить hedge.
+	if got := n.Load(); got != 1 {
+		t.Errorf("attempts=%d, want 1", got)
+	}
+}
+
+// Тестируем что AttemptTimeout срабатывает и считается retryable.
+func TestDo_AttemptTimeoutTriggersHedge(t *testing.T) {
+	h := New()
+	cfg := fastConfig(2)
+	cfg.AttemptTimeout = 50 * time.Millisecond
+	cfg.DefaultDelay = 10 * time.Millisecond
+	h.Register("k", cfg)
+
+	var n atomic.Int32
+	got, err := Do(context.Background(), h, "k", func(ctx context.Context) (int, error) {
+		i := n.Add(1)
+		if i == 1 {
+			<-ctx.Done()
+			return 0, ctx.Err() // получит DeadlineExceeded → kiharo переведёт в ErrAttemptTimeout
+		}
+		return 42, nil
+	})
+	if err != nil {
+		t.Fatalf("hedged should win after first times out: %v", err)
+	}
+	if got != 42 {
+		t.Errorf("got %d, want 42", got)
+	}
+}
+
+// Тестируем что все попытки по timeout → возвращаем ErrAttemptTimeout.
+func TestDo_AllAttemptsTimeout(t *testing.T) {
+	h := New()
+	cfg := fastConfig(2)
+	cfg.AttemptTimeout = 20 * time.Millisecond
+	cfg.DefaultDelay = 5 * time.Millisecond
+	h.Register("k", cfg)
+
+	_, err := Do(context.Background(), h, "k", func(ctx context.Context) (int, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	if !errors.Is(err, ErrAttemptTimeout) {
+		t.Errorf("got %v, want ErrAttemptTimeout", err)
+	}
+	// Должно работать и для context.DeadlineExceeded через Is/Unwrap
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("ErrAttemptTimeout should also match context.DeadlineExceeded")
+	}
+}
+
+var errBusinessError = errors.New("business 404")
