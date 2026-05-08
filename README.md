@@ -22,7 +22,7 @@ Most hedging libraries make you pick a delay by hand. Pick it too low and you do
 go get github.com/BawNer/kiharo
 ```
 
-Requires Go 1.26+.
+Requires Go 1.22+.
 
 ## Usage
 
