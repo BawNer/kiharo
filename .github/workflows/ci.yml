@@ -18,13 +18,15 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local  # запретить автозагрузку новых тулчейнов
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: "1.22"  # фиксированная версия, не stable
           cache: true
 
       - name: go vet
@@ -36,14 +38,16 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
-          cache: false  # golangci-lint-action держит свой кэш
+          go-version: "1.22"
+          cache: false
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
