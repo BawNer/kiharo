@@ -124,8 +124,8 @@ The `main` stays thin: build one `Hedger`, hand it out.
 
 Part of a small set of focused Go libraries with the same philosophy — simple API, no magic, bring your own metrics:
 
-- [`kahora`](https://github.com/yourusername/kahora) — sharded cache with gradual map shrink
-- [`haroku`](https://github.com/yourusername/haroku) — graceful shutdown, register anywhere
+- [`kahora`](https://github.com/BawNer/kahora) — sharded cache with gradual map shrink
+- [`haroku`](https://github.com/BawNer/haroku) — graceful shutdown, register anywhere
 - `kiharo` — adaptive hedged requests
 
 ## Status
