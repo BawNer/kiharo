@@ -40,56 +40,36 @@ func (p Percentile) valid() bool {
 
 const maxAllowedCalls = 3
 
-// Config validation errors. Wrap-friendly: use errors.Is to check.
 var (
-	ErrInvalidMaxCalls       = errors.New("kiharo: MaxCalls must be between 1 and 3")
-	ErrInvalidWindow         = errors.New("kiharo: Window must be WindowSmall, WindowMedium, or WindowLarge")
-	ErrInvalidPercentile     = errors.New("kiharo: Percentile must be P75, P90, or P95")
+	ErrInvalidMaxCalls       = errors.New("kiharo: MaxCalls must be 1..3")
+	ErrInvalidWindow         = errors.New("kiharo: invalid Window")
+	ErrInvalidPercentile     = errors.New("kiharo: invalid Percentile")
 	ErrInvalidMinDelay       = errors.New("kiharo: MinDelay must be >= 0")
 	ErrInvalidMaxDelay       = errors.New("kiharo: MaxDelay must be > 0")
-	ErrInvalidDelayBounds    = errors.New("kiharo: MinDelay must be <= MaxDelay")
+	ErrInvalidDelayBounds    = errors.New("kiharo: MinDelay > MaxDelay")
 	ErrInvalidDefaultDelay   = errors.New("kiharo: DefaultDelay must be > 0")
 	ErrInvalidAttemptTimeout = errors.New("kiharo: AttemptTimeout must be >= 0")
 )
 
-// ErrAttemptTimeout is returned (as the cause) when an individual attempt
-// exceeds RegisterConfig.AttemptTimeout. It wraps context.DeadlineExceeded,
-// so errors.Is works for both:
-//
-//	errors.Is(err, kiharo.ErrAttemptTimeout) // attempt-level timeout
-//	errors.Is(err, context.DeadlineExceeded) // any deadline-related error
+// ErrAttemptTimeout is returned when a single attempt exceeds AttemptTimeout.
+// Wraps context.DeadlineExceeded.
 var ErrAttemptTimeout = attemptTimeoutError{}
 
 type attemptTimeoutError struct{}
 
-func (attemptTimeoutError) Error() string        { return "kiharo: attempt timeout exceeded" }
-func (attemptTimeoutError) Is(target error) bool { return target == context.DeadlineExceeded }
-func (attemptTimeoutError) Unwrap() error        { return context.DeadlineExceeded }
+func (attemptTimeoutError) Error() string   { return "kiharo: attempt timeout" }
+func (attemptTimeoutError) Is(t error) bool { return t == context.DeadlineExceeded }
+func (attemptTimeoutError) Unwrap() error   { return context.DeadlineExceeded }
 
-// RegisterConfig is the per-key configuration passed to Hedger.Register.
 type RegisterConfig struct {
-	MaxCalls     int           // 1, 2, or 3. 1 disables hedging.
-	Window       WindowSize    // sliding-window size for latency stats
-	Percentile   Percentile    // window percentile used as hedge delay
-	MinDelay     time.Duration // lower clamp on computed delay
-	MaxDelay     time.Duration // upper clamp on computed delay
-	DefaultDelay time.Duration // delay used until the window fills
-
-	// AttemptTimeout caps wall-clock time of a single attempt. Zero means no
-	// per-attempt timeout (only the parent context's deadline applies).
-	// When an attempt times out, it is automatically treated as retryable
-	// regardless of IsRetryable, since timeout is an infrastructure-level
-	// failure rather than a domain-level outcome.
+	MaxCalls       int
+	Window         WindowSize
+	Percentile     Percentile
+	MinDelay       time.Duration
+	MaxDelay       time.Duration
+	DefaultDelay   time.Duration
 	AttemptTimeout time.Duration
-
-	// IsRetryable filters which fn errors should trigger hedging vs return
-	// immediately. Returning false means "this is a final answer, don't waste
-	// effort on more attempts". Useful for HTTP 4xx, gRPC NotFound,
-	// validation errors, etc.
-	//
-	// Nil means all errors are retryable (the previous default behaviour).
-	// AttemptTimeout failures are always retryable regardless of this filter.
-	IsRetryable func(error) bool
+	IsRetryable    func(error) bool
 }
 
 func (c RegisterConfig) validate() error {

@@ -1,3 +1,8 @@
+// Package kiharo implements adaptive hedged requests for reducing tail latency.
+//
+// A Hedger keeps per-key latency stats and uses a configurable percentile
+// of recent successful first-attempt latencies as the delay before launching
+// hedged attempts.
 package kiharo
 
 import (
@@ -9,9 +14,9 @@ import (
 )
 
 var (
-	ErrUnknownKey = errors.New("kiharo: unknown key (did you call Register?)")
-	ErrNilFunc    = errors.New("kiharo: function must not be nil")
-	ErrNilHedger  = errors.New("kiharo: Hedger is nil")
+	ErrUnknownKey = errors.New("kiharo: unknown key")
+	ErrNilFunc    = errors.New("kiharo: nil func")
+	ErrNilHedger  = errors.New("kiharo: nil Hedger")
 )
 
 type Option func(*Hedger)
@@ -24,6 +29,8 @@ func WithMetrics(r MetricsRecorder) Option {
 	}
 }
 
+// Hedger dispatches hedged calls and tracks per-key latency.
+// One per application; safe for concurrent use.
 type Hedger struct {
 	keys    sync.Map
 	metrics MetricsRecorder
@@ -37,12 +44,12 @@ func New(opts ...Option) *Hedger {
 	return h
 }
 
+// Register configures a key. Panics on invalid cfg or duplicate keys.
 func (h *Hedger) Register(key string, cfg RegisterConfig) {
 	if err := cfg.validate(); err != nil {
-		panic(fmt.Sprintf("kiharo: invalid RegisterConfig for key %q: %v", key, err))
+		panic(fmt.Sprintf("kiharo: invalid config for %q: %v", key, err))
 	}
-	s := newStats(cfg)
-	if _, loaded := h.keys.LoadOrStore(key, s); loaded {
+	if _, loaded := h.keys.LoadOrStore(key, newStats(cfg)); loaded {
 		panic(fmt.Sprintf("kiharo: key %q already registered", key))
 	}
 }
@@ -55,6 +62,8 @@ func (h *Hedger) statsFor(key string) *stats {
 	return v.(*stats)
 }
 
+// Do runs fn up to MaxCalls times in parallel. The first success wins;
+// remaining attempts are cancelled. If all fail, returns the first error.
 func Do[T any](
 	ctx context.Context,
 	h *Hedger,
@@ -78,7 +87,6 @@ func Do[T any](
 	cfg := s.cfg
 	metrics := h.metrics
 
-	// Fast path: no hedging configured.
 	if cfg.MaxCalls == 1 {
 		v, err, dur := runAttempt(ctx, cfg, fn)
 		metrics.RecordRequest(false)
@@ -111,15 +119,18 @@ func Do[T any](
 			v, err, dur := runAttempt(runCtx, cfg, fn)
 			metrics.RecordResponse(hedged, err, dur)
 
-			// Only the first attempt's successful latency feeds the window.
 			if !hedged && err == nil {
 				s.observe(dur)
 			}
 
-			retryable := classifyRetryable(err, cfg, runCtx)
-
+			r := result{
+				value:     v,
+				err:       err,
+				hedged:    hedged,
+				retryable: classifyRetryable(err, cfg, runCtx),
+			}
 			select {
-			case results <- result{value: v, err: err, hedged: hedged, retryable: retryable}:
+			case results <- r:
 			case <-runCtx.Done():
 			}
 		}()
@@ -128,13 +139,12 @@ func Do[T any](
 	go func() {
 		launch(1)
 		for attempt := 2; attempt <= cfg.MaxCalls; attempt++ {
-			d := s.delay()
-			timer := time.NewTimer(d)
+			t := time.NewTimer(s.delay())
 			select {
-			case <-timer.C:
+			case <-t.C:
 				launch(attempt)
 			case <-runCtx.Done():
-				timer.Stop()
+				t.Stop()
 				return
 			}
 		}
@@ -154,8 +164,6 @@ func Do[T any](
 				}
 				return r.value, nil
 			}
-			// Non-retryable error: this is the final answer, no point waiting
-			// for or launching more attempts.
 			if !r.retryable {
 				return zero, r.err
 			}
@@ -170,27 +178,22 @@ func Do[T any](
 	}
 }
 
-// runAttempt executes a single fn invocation with the configured AttemptTimeout
-// applied (if any). Returns the result, error, and wall-clock duration of the call.
 func runAttempt[T any](
 	parent context.Context,
 	cfg RegisterConfig,
 	fn func(ctx context.Context) (T, error),
 ) (T, error, time.Duration) {
-	attemptCtx := parent
+	ctx := parent
 	var cancel context.CancelFunc
 	if cfg.AttemptTimeout > 0 {
-		attemptCtx, cancel = context.WithTimeout(parent, cfg.AttemptTimeout)
+		ctx, cancel = context.WithTimeout(parent, cfg.AttemptTimeout)
 		defer cancel()
 	}
 
 	start := time.Now()
-	v, err := fn(attemptCtx)
+	v, err := fn(ctx)
 	dur := time.Since(start)
 
-	// If the parent is fine but the attempt context's deadline fired, this is
-	// our AttemptTimeout. Replace the generic deadline error with our sentinel
-	// so callers can distinguish attempt timeout from parent cancellation.
 	if err != nil && cfg.AttemptTimeout > 0 && parent.Err() == nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			err = ErrAttemptTimeout
@@ -199,20 +202,11 @@ func runAttempt[T any](
 	return v, err, dur
 }
 
-// classifyRetryable decides whether an error should trigger more hedging or
-// be returned to the caller immediately.
-//
-//   - nil: not applicable (caller checks err == nil first)
-//   - parent context cancelled: parent will short-circuit anyway, value doesn't matter
-//   - ErrAttemptTimeout: always retryable (infrastructure-level failure)
-//   - IsRetryable nil: treat all errors as retryable (back-compat default)
-//   - otherwise: ask the user's filter
 func classifyRetryable(err error, cfg RegisterConfig, runCtx context.Context) bool {
 	if err == nil {
 		return true
 	}
 	if runCtx.Err() != nil {
-		// Context already torn down; the main loop is about to exit anyway.
 		return true
 	}
 	if errors.Is(err, ErrAttemptTimeout) {
