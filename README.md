@@ -182,10 +182,6 @@ Part of a small set of focused Go libraries with the same philosophy — simple 
 - [`haroku`](https://github.com/BawNer/haroku) — graceful shutdown, register anywhere
 - `kiharo` — adaptive hedged requests
 
-## Status
-
-Pre-1.0. API may change before v1.0 based on real-world feedback. The pre-1.0 window is the right time to push back on API decisions — issues and PRs welcome.
-
 ## License
 
 MIT
