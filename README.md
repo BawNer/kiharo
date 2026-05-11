@@ -1,20 +1,22 @@
 # kiharo
 
-Adaptive hedged requests for Go. Reduces tail latency without external dependencies.
+Hedged requests for Go with adaptive delay. No external dependencies.
 
 [![CI](https://github.com/BawNer/kiharo/actions/workflows/ci.yml/badge.svg)](https://github.com/BawNer/kiharo/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/BawNer/kiharo.svg)](https://pkg.go.dev/github.com/BawNer/kiharo)
 [![Go Report Card](https://goreportcard.com/badge/github.com/BawNer/kiharo)](https://goreportcard.com/report/github.com/BawNer/kiharo)
 
-## What it does
+## What
 
-When a request is slow, `kiharo` fires additional parallel attempts after a delay derived from real latency statistics. The first successful response wins; the rest are cancelled via context. P99 spikes shrink, your zero-config setup stays zero-config.
+If a call takes too long, kiharo fires another one (or two) in parallel after some delay. Whoever finishes first wins, the rest get cancelled via context. Helps with tail latency.
 
-## Why another hedging library
+The delay is the part most libraries get wrong, so let's talk about it.
 
-Most hedging libraries make you pick a delay by hand. Pick it too low and you double your load. Pick it too high and the hedge never helps. The "right" delay depends on your dependency's actual P75 latency right now — which changes throughout the day.
+## Why I wrote this
 
-`kiharo` measures it. The library keeps a sliding window of recent successful first-attempt latencies per key and uses a configurable percentile of that window as the hedge delay. No StatsD, no Prometheus required, no external service. Just a fixed-size ring buffer in memory.
+I needed hedging in a service and looked at what was already out there. Almost everything wants you to hardcode the delay. Pick 10ms and you'll hedge basically every request (load goes up 2x for nothing). Pick 200ms and the hedge fires after the user is gone. The "right" number is something like P75 of your real latency, which drifts during the day depending on how the upstream feels.
+
+So measure it. kiharo keeps a small ring buffer of recent first-attempt latencies per key and takes a percentile from it. That's the delay. No StatsD, no Prom, just a slice in memory.
 
 ## Install
 
@@ -22,7 +24,7 @@ Most hedging libraries make you pick a delay by hand. Pick it too low and you do
 go get github.com/BawNer/kiharo
 ```
 
-Requires Go 1.22+.
+Go 1.22+.
 
 ## Usage
 
@@ -42,10 +44,10 @@ func main() {
     hedger.Register("get-user", kiharo.RegisterConfig{
         MaxCalls:     2,
         Window:       kiharo.WindowSmall,   // 100 samples
-        Percentile:   kiharo.P75,           // hedge when first call is slower than 75% of history
+        Percentile:   kiharo.P75,
         MinDelay:     5 * time.Millisecond,
         MaxDelay:     500 * time.Millisecond,
-        DefaultDelay: 20 * time.Millisecond, // used until the window fills
+        DefaultDelay: 20 * time.Millisecond, // until the window fills
     })
 
     user, err := kiharo.Do(ctx, hedger, "get-user", func(ctx context.Context) (User, error) {
@@ -54,57 +56,59 @@ func main() {
 }
 ```
 
-That's the whole API. One `Hedger` per application, register your keys at startup, call `Do` from anywhere.
+One Hedger per app, register your keys at startup, call `Do` from wherever.
 
-## How the adaptive delay works
+## The delay
 
-Calls 1..N-1   → window not full → use DefaultDelay
-Calls N+       → window full → use Percentile of window
-→ clamped to [MinDelay, MaxDelay]
+```
+window not full → DefaultDelay
+window full     → percentile of the window
+result          → clamped to [MinDelay, MaxDelay]
+```
 
-Only successful first attempts feed the window. Hedged latencies are excluded — otherwise you'd get a feedback loop where smaller delays produce more hedge samples and push the percentile down further.
+Only first attempts feed the window. Hedged ones are ignored on purpose, otherwise you end up with a loop: smaller delay → more hedges → percentile drops → smaller delay → ...
 
-## Configuration
+## Config
 
-`RegisterConfig` is opinionated by design. Bad values that hurt more than help are not exposed:
+`RegisterConfig` doesn't accept arbitrary values. The ones that mostly hurt are not allowed:
 
-| Field | Allowed values | Default |
+| Field | Allowed | Default |
 |---|---|---|
-| `MaxCalls` | 1, 2, or 3 | required |
+| `MaxCalls` | 1, 2, 3 | required |
 | `Window` | `WindowSmall` (100), `WindowMedium` (500), `WindowLarge` (1000) | required |
 | `Percentile` | `P75`, `P90`, `P95` | required |
-| `MinDelay` | `time.Duration ≥ 0` | required |
-| `MaxDelay` | `time.Duration > 0`, `≥ MinDelay` | required |
-| `DefaultDelay` | `time.Duration > 0` | required |
-| `AttemptTimeout` | `time.Duration ≥ 0`, 0 = unlimited | 0 |
-| `IsRetryable` | `func(error) bool`, nil = all errors retryable | nil |
+| `MinDelay` | `>= 0` | required |
+| `MaxDelay` | `> 0`, `>= MinDelay` | required |
+| `DefaultDelay` | `> 0` | required |
+| `AttemptTimeout` | `>= 0`, 0 means no limit | 0 |
+| `IsRetryable` | `func(error) bool`, nil = retry everything | nil |
 
-`MaxCalls=10` is a self-DoS. `Percentile=P50` means hedging half your traffic. `Window=10` gives you noise. The library makes those choices for you.
+`MaxCalls=10` is just DoS on yourself. `P50` means you hedge half your traffic, which is silly. `Window=10` is noise, not stats. So those aren't options.
 
 ## Per-attempt timeout
 
-`AttemptTimeout` caps wall-clock time for a single attempt. When it fires, `kiharo` cancels that attempt's context and treats it as a transient failure — the hedge keeps going as if the attempt never finished:
+`AttemptTimeout` caps wall time for one attempt. When it trips, kiharo cancels that attempt's ctx and treats it like a transient failure, the next hedge keeps going:
 
 ```go
 hedger.Register("flaky-upstream", kiharo.RegisterConfig{
     MaxCalls:       3,
     AttemptTimeout: 200 * time.Millisecond,
-    // ... rest of config
+    // ...
 })
 ```
 
-If every attempt times out, `Do` returns `kiharo.ErrAttemptTimeout`. It wraps `context.DeadlineExceeded`, so both checks work:
+If every attempt times out, you get `kiharo.ErrAttemptTimeout`. It wraps `context.DeadlineExceeded`, so either check works:
 
 ```go
-errors.Is(err, kiharo.ErrAttemptTimeout)        // attempt-level timeout specifically
-errors.Is(err, context.DeadlineExceeded)        // any deadline-related error
+errors.Is(err, kiharo.ErrAttemptTimeout)        // specifically the attempt timeout
+errors.Is(err, context.DeadlineExceeded)        // any deadline
 ```
 
-`AttemptTimeout` and the parent `ctx.Done()` compose naturally — set `AttemptTimeout` per endpoint, set an overall budget via `context.WithTimeout` at the call site. Whichever fires first wins.
+You can also wrap the whole `Do` in `context.WithTimeout` for the total budget. Whichever fires first wins, they compose fine.
 
-## Filtering retryable errors
+## Retryable errors
 
-Not every error is worth hedging. A 404 is a final answer; firing more requests just amplifies load for no benefit. Use `IsRetryable` to short-circuit:
+Hedging a 404 is pointless, the answer isn't going to change. `IsRetryable` lets you short-circuit:
 
 ```go
 hedger.Register("userapi.get", kiharo.RegisterConfig{
@@ -113,24 +117,24 @@ hedger.Register("userapi.get", kiharo.RegisterConfig{
     IsRetryable: func(err error) bool {
         var apiErr *userapi.Error
         if errors.As(err, &apiErr) {
-            return apiErr.Status >= 500  // 5xx retryable, 4xx final
+            return apiErr.Status >= 500
         }
-        return true  // network errors and timeouts: retry
+        return true // network/timeouts: try again
     },
 })
 ```
 
-When `IsRetryable` returns `false`, `Do` returns immediately with that error. No further attempts launch, in-flight attempts are cancelled.
+If `IsRetryable` returns false, `Do` returns immediately, in-flight attempts get cancelled.
 
-`AttemptTimeout` failures are always retryable, regardless of `IsRetryable` — timeout is an infrastructure failure (the attempt got stuck), not a domain answer.
+One exception: `AttemptTimeout` failures are always retryable, even if your `IsRetryable` would say no. Reason: a timeout means the attempt got stuck, it's not a real answer from the server.
 
 ## Memory
 
-`Window × 8 bytes` per registered key. `WindowLarge` = 8 KB. Predictable, bounded, no eviction logic to misconfigure.
+`Window * 8 bytes` per key. So `WindowLarge` is 8 KB. Bounded, predictable, nothing to evict.
 
 ## Metrics
 
-Bring your own. Implement `MetricsRecorder`:
+Plug in your own. Implement `MetricsRecorder`:
 
 ```go
 type MetricsRecorder interface {
@@ -142,19 +146,19 @@ type MetricsRecorder interface {
 hedger := kiharo.New(kiharo.WithMetrics(myRecorder))
 ```
 
-`RecordHedgeWin` is the one to watch — it tells you how often hedging actually rescued a slow call. If it's near zero, your `Percentile` is too high. If it's near 50%, it's too low.
+`RecordHedgeWin` is the useful one. It's how often the hedge actually saved a slow call. If you see ~0, your percentile is too high. If you see ~half your traffic, it's too low.
 
-## Design notes
+## Notes
 
-- **Top-level `Do`, not a method.** Go doesn't allow type parameters on methods yet. Pass the `*Hedger` explicitly.
-- **Panic on misconfiguration.** `Register` panics on invalid config or duplicate keys. Startup-time bugs should fail loud, not lurk.
-- **First successful attempt wins, first error returned.** When all attempts fail, you get the first error that came back, not a wrapped multi-error.
-- **Context cancellation propagates.** Children inherit, winner cancels siblings, parent cancellation tears everything down.
-- **`AttemptTimeout` is always retryable, `IsRetryable` handles domain errors.** Timeout is an infrastructure failure (this attempt got stuck); business errors like 404 are domain answers (this attempt told the truth, don't ask again). Keeping them in separate fields keeps the line clear.
+- `Do` is a top-level function, not a method. Go still doesn't allow type params on methods.
+- `Register` panics on bad config or a duplicate key. That's intentional, startup-time bugs should be loud.
+- On full failure you get the first error back, not a wrapped multi-error.
+- Context cancellation: child attempts inherit from `Do`'s ctx, the winner cancels the others, parent cancel tears everything down.
+- `AttemptTimeout` is infra-level (got stuck), `IsRetryable` is domain-level (server said no). They're separate fields on purpose.
 
-## Recipe: register near the domain
+## Where to put `Register`
 
-The library is happy with one `Hedger` shared across packages. Register where the domain knowledge lives — usually in the constructor of the client that knows what its dependency looks like:
+One Hedger shared across packages is fine. I usually put the `Register` call in the constructor of whatever client knows the upstream:
 
 ```go
 func NewUserClient(http *http.Client, hedger *kiharo.Hedger) *UserClient {
@@ -172,15 +176,14 @@ func NewUserClient(http *http.Client, hedger *kiharo.Hedger) *UserClient {
 }
 ```
 
-The `main` stays thin: build one `Hedger`, hand it out.
+`main` stays small: build a Hedger, pass it around.
 
-## Ecosystem
+## Related
 
-Part of a small set of focused Go libraries with the same philosophy — simple API, no magic, bring your own metrics:
+A couple of other small libs I maintain in a similar style:
 
 - [`kahora`](https://github.com/BawNer/kahora) — sharded cache with gradual map shrink
-- [`haroku`](https://github.com/BawNer/haroku) — graceful shutdown, register anywhere
-- `kiharo` — adaptive hedged requests
+- [`haroku`](https://github.com/BawNer/haroku) — graceful shutdown, register from anywhere
 
 ## License
 
